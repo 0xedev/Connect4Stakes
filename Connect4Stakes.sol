@@ -3,82 +3,98 @@ pragma solidity ^0.8.24;
 
 /**
  * Connect4Stakes
- * - Create a match with ERC20 stake per player
- * - Opponent joins and deposits the same stake
- * - Winner can be finalized by: (a) both players agreeing, or (b) an authorized resolver
- * - Optional platform fee (basis points) taken from the pot on payout
- * - Deadlines to avoid stuck funds; refunds if match doesn't start or cannot be resolved
+ * - Creator opens a match with an ERC-20 stake
+ * - Opponent joins by matching the stake
+ * - Winner is finalized either by:
+ *    (a) both players submitting the same winner (mutual confirmation), or
+ *    (b) an authorized referee (per-match resolver or global resolver/owner)
+ * - Deadlines prevent stuck funds:
+ *    - If nobody joins by startDeadline => creator refunds
+ *    - If not resolved by resolveDeadline => each player can withdraw their own stake
+ * - Optional platform fee (bps) taken from total pot on payout
+ * - EIP-2612 permit helper for creator UX
  */
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/structs/BitMaps.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
-
-interface IERC20Decimals {
-    function decimals() external view returns (uint8);
-}
 
 contract Connect4Stakes is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    // ------------------------- Types -------------------------
     enum Status {
         Created,   // creator deposited; waiting for opponent
         Started,   // both deposited; in play
-        Resolved,  // winner decided; pot claimed
+        Resolved,  // winner decided; pot paid
         Refunded   // funds returned (no winner)
     }
 
     struct Match {
+        // identities
         address creator;
-        address opponent;         // set if direct challenge; 0 for open
-        address token;            // ERC20 token used for stakes
-        uint96  stake;            // amount per player
+        address opponent;        // if zero, it's an open challenge
+        address token;           // ERC-20 used
+        // money/time
+        uint96  stake;           // per player
         uint40  createdAt;
-        uint40  startDeadline;    // by when opponent must join (else refund creator)
-        uint40  resolveDeadline;  // by when result should be decided (else refunds)
-        address resolver;         // optional referee/host allowed to resolve
+        uint40  startDeadline;   // opponent must join by this time
+        uint40  resolveDeadline; // match must be resolved by this time once started
+        uint32  resolveWindow;   // seconds to use for resolveDeadline once started
+        // control
+        address resolver;        // optional per-match referee
+        uint16  feeBps;          // snapshot of fee at creation
         Status  status;
-        address winner;           // set when resolved
-        uint16  feeBps;           // snapshot of fee at match start
-        bool    creatorConfirmed; // for mutual result confirmation
-        bool    opponentConfirmed;
+        address winner;          // set when Resolved
+        // mutual confirmation votes
+        address creatorVote;     // zero if no vote; else submitted winner address
+        address opponentVote;    // zero if no vote; else submitted winner address
     }
 
-    // fee configuration
+    // ------------------------- Config -------------------------
     address public feeRecipient;
-    uint16  public maxFeeBps = 500; // 5% cap
-    uint16  public defaultFeeBps = 0;
+    uint16  public defaultFeeBps = 0;   // can be 0
+    uint16  public maxFeeBps = 500;     // <= 5% cap
 
-    // permissions
-    mapping(address => bool) public isResolver; // addresses allowed to resolve any match
+    mapping(address => bool) public isResolver; // global referees
 
-    // storage
+    // ------------------------- Storage -------------------------
     uint256 public nextMatchId = 1;
     mapping(uint256 => Match) public matches;
+    mapping(uint256 => mapping(address => bool)) public withdrawnAfterTimeout; // id => player => withdrew?
 
-    // events
-    event MatchCreated(uint256 indexed id, address indexed creator, address indexed token, uint256 stake, address opponent, uint256 startDeadline, uint256 resolveDeadline, address resolver);
-    event MatchJoined(uint256 indexed id, address indexed opponent);
-    event MatchResultSubmitted(uint256 indexed id, address indexed submitter, address indexed winner);
+    // ------------------------- Events -------------------------
+    event MatchCreated(
+        uint256 indexed id,
+        address indexed creator,
+        address indexed token,
+        uint256 stake,
+        address opponent,
+        uint256 startDeadline,
+        uint256 resolveWindow,
+        address resolver
+    );
+    event MatchJoined(uint256 indexed id, address indexed opponent, uint256 resolveDeadline);
+    event MatchResultSubmitted(uint256 indexed id, address indexed submitter, address winner);
     event MatchResolved(uint256 indexed id, address indexed winner, uint256 prize, uint256 fee);
     event MatchRefunded(uint256 indexed id);
     event ResolverSet(address indexed resolver, bool allowed);
     event FeesUpdated(address indexed recipient, uint16 defaultFeeBps, uint16 maxFeeBps);
 
+    // ------------------------- Constructor -------------------------
     constructor(address _feeRecipient) Ownable(msg.sender) {
         feeRecipient = _feeRecipient;
     }
 
-    // --------- Admin ---------
+    // ------------------------- Admin -------------------------
     function setResolver(address account, bool allowed) external onlyOwner {
         isResolver[account] = allowed;
         emit ResolverSet(account, allowed);
     }
 
     function setFees(address recipient, uint16 _defaultFeeBps, uint16 _maxFeeBps) external onlyOwner {
-        require(_maxFeeBps <= 1000, "max >10% not allowed");
+        require(_maxFeeBps <= 1000, "max >10%");
         require(_defaultFeeBps <= _maxFeeBps, "default > max");
         feeRecipient = recipient;
         defaultFeeBps = _defaultFeeBps;
@@ -86,26 +102,26 @@ contract Connect4Stakes is Ownable, ReentrancyGuard {
         emit FeesUpdated(recipient, _defaultFeeBps, _maxFeeBps);
     }
 
-    // --------- Create / Join ---------
+    // ------------------------- Create / Join -------------------------
 
     /**
-     * Create a match. Creator must approve this contract for `stake` beforehand.
-     * - opponent = address(0) for open challenge
-     * - resolver can be address(0) to rely on mutual confirmation or global resolvers
-     * - startDeadlineSec: seconds from now for join window
-     * - resolveDeadlineSec: seconds from start until resolution window
+     * @notice Create a match (creator must approve this contract for `stake` first, unless using permit).
+     * @param token ERC-20 token address for stakes
+     * @param stake Amount each player must deposit (same token decimals for both)
+     * @param opponent If nonzero, only this address may join. Zero => open challenge
+     * @param startDeadlineSec Seconds from now for the join window (>= 60)
+     * @param resolveWindowSec Seconds allowed for resolution after opponent joins (>= 300)
+     * @param resolver Optional per-match referee (can be zero)
      */
     function createMatch(
         address token,
         uint96  stake,
         address opponent,
         uint32  startDeadlineSec,
-        uint32  resolveDeadlineSec,
+        uint32  resolveWindowSec,
         address resolver
     ) external nonReentrant returns (uint256 id) {
-        require(stake > 0, "stake = 0");
-        require(startDeadlineSec >= 60, "join window too short");
-        require(resolveDeadlineSec >= 300, "resolve window too short");
+        _validateCreate(stake, startDeadlineSec, resolveWindowSec);
 
         id = nextMatchId++;
         Match storage m = matches[id];
@@ -115,7 +131,7 @@ contract Connect4Stakes is Ownable, ReentrancyGuard {
         m.stake = stake;
         m.createdAt = uint40(block.timestamp);
         m.startDeadline = uint40(block.timestamp + startDeadlineSec);
-        m.resolveDeadline = uint40(0); // set when match starts
+        m.resolveWindow = resolveWindowSec;
         m.resolver = resolver;
         m.status = Status.Created;
         m.feeBps = defaultFeeBps;
@@ -124,83 +140,110 @@ contract Connect4Stakes is Ownable, ReentrancyGuard {
         IERC20(token).safeTransferFrom(msg.sender, address(this), stake);
 
         emit MatchCreated(
-            id, msg.sender, token, stake, opponent,
-            m.startDeadline, 0, resolver
+            id, msg.sender, token, stake, opponent, m.startDeadline, m.resolveWindow, resolver
         );
     }
 
     /**
-     * Join an existing match (deposit equal stake).
-     * If the match specified a direct opponent, only that address can join.
+     * @notice Same as createMatch but uses EIP-2612 permit so the creator can skip an approve tx.
      */
-    function joinMatch(uint256 id) external nonReentrant {
-        Match storage m = matches[id];
-        require(m.status == Status.Created, "not joinable");
-        require(block.timestamp <= m.startDeadline, "join window over");
-        if (m.opponent != address(0)) require(msg.sender == m.opponent, "not invited");
-
-        // set opponent if open challenge
-        if (m.opponent == address(0)) {
-            m.opponent = msg.sender;
-        }
-
-        IERC20(m.token).safeTransferFrom(msg.sender, address(this), m.stake);
-        m.status = Status.Started;
-        m.resolveDeadline = uint40(block.timestamp + _resolveWindow(id));
-
-        emit MatchJoined(id, m.opponent);
-    }
-
-    // Convenience: create+join with EIP-2612 permit for the creator (single tx UX still requires 2 calls for opponent)
     function createMatchWithPermit(
         address token,
         uint96  stake,
         address opponent,
         uint32  startDeadlineSec,
-        uint32  resolveDeadlineSec,
+        uint32  resolveWindowSec,
         address resolver,
         uint256 permitValue,
         uint256 permitDeadline,
-        uint8 v, bytes32 r, bytes32 s
+        uint8 v,
+        bytes32 r,
+        bytes32 s
     ) external nonReentrant returns (uint256 id) {
-        // permit for this contract to pull funds
+        _validateCreate(stake, startDeadlineSec, resolveWindowSec);
+
+        // authorize this contract to pull creator's funds
         IERC20Permit(token).permit(msg.sender, address(this), permitValue, permitDeadline, v, r, s);
         require(permitValue >= stake, "permit < stake");
-        return createMatch(token, stake, opponent, startDeadlineSec, resolveDeadlineSec, resolver);
+
+        id = nextMatchId++;
+        Match storage m = matches[id];
+        m.creator = msg.sender;
+        m.opponent = opponent;
+        m.token = token;
+        m.stake = stake;
+        m.createdAt = uint40(block.timestamp);
+        m.startDeadline = uint40(block.timestamp + startDeadlineSec);
+        m.resolveWindow = resolveWindowSec;
+        m.resolver = resolver;
+        m.status = Status.Created;
+        m.feeBps = defaultFeeBps;
+
+        IERC20(token).safeTransferFrom(msg.sender, address(this), stake);
+
+        emit MatchCreated(
+            id, msg.sender, token, stake, opponent, m.startDeadline, m.resolveWindow, resolver
+        );
     }
 
-    // --------- Result & Resolution ---------
+    function _validateCreate(uint96 stake, uint32 startDeadlineSec, uint32 resolveWindowSec) internal pure {
+        require(stake > 0, "stake = 0");
+        require(startDeadlineSec >= 60, "join window too short");
+        require(resolveWindowSec >= 300, "resolve window too short");
+    }
 
     /**
-     * Players can both submit the same winner to auto-resolve.
-     * Either player may call it. If both confirmations agree, payout occurs immediately.
+     * @notice Opponent joins an existing match by depositing the same stake.
+     *         If opponent was unspecified (open challenge), the caller becomes opponent.
+     */
+    function joinMatch(uint256 id) external nonReentrant {
+        Match storage m = matches[id];
+        require(m.status == Status.Created, "not joinable");
+        require(block.timestamp <= m.startDeadline, "join window over");
+
+        if (m.opponent != address(0)) {
+            require(msg.sender == m.opponent, "not invited");
+        } else {
+            m.opponent = msg.sender;
+        }
+
+        IERC20(m.token).safeTransferFrom(msg.sender, address(this), m.stake);
+
+        m.status = Status.Started;
+        m.resolveDeadline = uint40(block.timestamp + m.resolveWindow);
+
+        emit MatchJoined(id, m.opponent, m.resolveDeadline);
+    }
+
+    // ------------------------- Result & Resolution -------------------------
+
+    /**
+     * @notice Players submit their view of the winner. If both match, payout immediately.
+     * @param id Match id
+     * @param winner Claimed winner (must be creator or opponent)
      */
     function submitResult(uint256 id, address winner) external nonReentrant {
         Match storage m = matches[id];
         require(m.status == Status.Started, "not started");
         require(block.timestamp <= m.resolveDeadline, "resolution window over");
+        require(winner == m.creator || winner == m.opponent, "invalid winner");
         require(msg.sender == m.creator || msg.sender == m.opponent, "not a player");
-        require(winner == m.creator || winner == m.opponent, "winner must be a player");
 
         if (msg.sender == m.creator) {
-            m.creatorConfirmed = (winner == m.creator);
-            if (winner == m.opponent) { m.creatorConfirmed = false; }
+            m.creatorVote = winner;
         } else {
-            m.opponentConfirmed = (winner == m.opponent);
-            if (winner == m.creator) { m.opponentConfirmed = false; }
+            m.opponentVote = winner;
         }
 
         emit MatchResultSubmitted(id, msg.sender, winner);
 
-        // If both confirmations indicate the same winner, resolve.
-        if (m.creatorConfirmed && m.opponentConfirmed) {
+        if (m.creatorVote != address(0) && m.creatorVote == m.opponentVote) {
             _payout(id, winner);
         }
     }
 
     /**
-     * Resolver path: owner/global resolver OR match-specific resolver can finalize.
-     * Can be used within or after the resolution window.
+     * @notice Referee path: per-match resolver, global resolver, or owner can finalize anytime after start.
      */
     function resolveByReferee(uint256 id, address winner) external nonReentrant {
         Match storage m = matches[id];
@@ -213,10 +256,10 @@ contract Connect4Stakes is Ownable, ReentrancyGuard {
         _payout(id, winner);
     }
 
-    // --------- Refunds / Safety Rails ---------
+    // ------------------------- Refunds / Safety Rails -------------------------
 
     /**
-     * If nobody joined in time, creator can refund their stake.
+     * @notice If nobody joined by startDeadline, creator refunds their stake.
      */
     function refundIfUnjoined(uint256 id) external nonReentrant {
         Match storage m = matches[id];
@@ -230,11 +273,9 @@ contract Connect4Stakes is Ownable, ReentrancyGuard {
     }
 
     /**
-     * If a started match didn't get resolved by deadline, either player can reclaim their own stake.
-     * This avoids stuck funds if no referee is available. Each player withdraws once.
+     * @notice If a started match wasn't resolved by resolveDeadline, each player can withdraw their own stake.
+     *         When both have withdrawn, status flips to Refunded.
      */
-    mapping(uint256 => mapping(address => bool)) public withdrawnAfterTimeout;
-
     function withdrawAfterTimeout(uint256 id) external nonReentrant {
         Match storage m = matches[id];
         require(m.status == Status.Started, "wrong status");
@@ -245,35 +286,25 @@ contract Connect4Stakes is Ownable, ReentrancyGuard {
         withdrawnAfterTimeout[id][msg.sender] = true;
         IERC20(m.token).safeTransfer(msg.sender, m.stake);
 
-        // If both withdrew, mark refunded
         if (withdrawnAfterTimeout[id][m.creator] && withdrawnAfterTimeout[id][m.opponent]) {
             m.status = Status.Refunded;
             emit MatchRefunded(id);
         }
     }
 
-    // --------- Views ---------
+    // ------------------------- Views -------------------------
     function getMatch(uint256 id) external view returns (Match memory) {
         return matches[id];
     }
 
     function pot(uint256 id) public view returns (uint256) {
         Match storage m = matches[id];
-        if (m.status == Status.Started) return uint256(m.stake) * 2;
-        if (m.status == Status.Resolved) return 0;
-        if (m.status == Status.Created) return uint256(m.stake); // only creator funded
+        if (m.status == Status.Created) return uint256(m.stake);      // only creator funded
+        if (m.status == Status.Started) return uint256(m.stake) * 2;  // both funded
         return 0;
     }
 
-    // --------- Internal ---------
-    function _resolveWindow(uint256 id) internal view returns (uint40) {
-        // read the intended resolve duration captured at createMatch call via startDeadline & resolveDeadlineSec
-        // To keep the API simple, we snapshot the *duration* at creation by piggybacking on feeBps:
-        // Instead, we just set a constant fallback of 3 hours if not provided.
-        // In practice you'd pass resolveDeadlineSec to storage; to keep struct small we derived it:
-        return 3 hours;
-    }
-
+    // ------------------------- Internal -------------------------
     function _payout(uint256 id, address winner) internal {
         Match storage m = matches[id];
         require(m.status == Status.Started, "not active");
